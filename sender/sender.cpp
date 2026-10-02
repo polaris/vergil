@@ -31,6 +31,7 @@
 #include "send_stats.h"
 #include "shutdown_signal.h"
 #include "stream_defaults.h"
+#include "test_signal.h"
 #include "thread_priority.h"
 #include "time_filter.h"
 
@@ -63,6 +64,7 @@ struct CaptureState {
     unsigned int sampleRate = 0;
     std::size_t bytesPerFrame = 0;
     double latency = 0.0;               // L, seconds from capture to the receivers' speakers
+    bool testSignal = false;            // send TestSignal in place of the input
 
     PacketRing* ring = nullptr;
     PacketsReady* ready = nullptr;
@@ -75,6 +77,7 @@ struct CaptureState {
     std::uint32_t session = 0;          // new for every run, so receivers can tell a restart from loss
     std::uint32_t sequence = 0;
     TimeFilter timeFilter{};
+    TestSignal signal{};
 };
 
 void printSendStats(const SendStats& stats, const CaptureStats& capture) {
@@ -141,7 +144,15 @@ void onCapture(void* user, const void* input, ma_uint32 frameCount) {
     streaming::encodeAudioPacketHeader(header, encoded);
 
     std::memcpy(slot->data.data(), encoded, kAudioPacketHeaderBytes);
-    std::memcpy(slot->data.data() + kAudioPacketHeaderBytes, input, frameCount * s.bytesPerFrame);
+    std::uint8_t* pcm = slot->data.data() + kAudioPacketHeaderBytes;
+    if (s.testSignal) {
+        // The slot is a byte array: build the samples aside, then copy.
+        std::int16_t samples[kMaxPayload / sizeof(std::int16_t)];
+        s.signal.fill(samples, frameCount);
+        std::memcpy(pcm, samples, frameCount * s.bytesPerFrame);
+    } else {
+        std::memcpy(pcm, input, frameCount * s.bytesPerFrame);
+    }
     slot->length = static_cast<std::uint32_t>(payload);
 
     s.ring->commit();
@@ -201,6 +212,8 @@ private:
 struct Options {
     unsigned int inputDeviceIndex = 0;
     double latencyMs = kDefaultLatencyMs;
+    bool testSignal = false;
+    bool kernelTimestamps = false;
     std::string networkInterface;
     std::string multicastGroup{streaming::kDefaultAudioGroup};
     unsigned short multicastPort = streaming::kDefaultAudioPort;
@@ -238,6 +251,10 @@ std::optional<int> parseOptions(int argc, char** argv, const AudioContext& audio
     app.add_option("-L,--latency", opts.latencyMs,
                    "Milliseconds from capture to the receivers' speakers, the same for every receiver")
         ->check(CLI::PositiveNumber);
+    app.add_flag("--testSignal", opts.testSignal,
+                 "Send a 10 ms noise burst at the start of every second instead of the input, for measuring receivers");
+    app.add_flag("--kernelTimestamps", opts.kernelTimestamps,
+                 "Clock sync: stamp received messages in the kernel, if the system offers it");
     app.add_option("-n,--networkInterface", opts.networkInterface, "Network interface");
     app.add_option("-m,--multicastGroup", opts.multicastGroup, "Multicast group address")
         ->check(CLI::ValidIPV4);
@@ -306,6 +323,7 @@ int main(int argc, char** argv) {
             .group = udp::endpoint(asio::ip::make_address(kClockGroup), kClockPort),
             .iface = *iface,
             .nodeId = clocksync::randomNodeId(),
+            .useKernelspaceStamps = opts.kernelTimestamps,
         }, clocksync::Role::Master);
     } catch (const std::exception& e) {
         std::cerr << "Failed to set up the clock-sync master: " << e.what() << "\n";
@@ -330,6 +348,7 @@ int main(int argc, char** argv) {
 
     CaptureState state{
         .latency = opts.latencyMs / 1000.0,
+        .testSignal = opts.testSignal,
         .ring = &packetRing,
         .ready = &ready,
         .stats = &captureStats,
@@ -364,6 +383,10 @@ int main(int argc, char** argv) {
     }
     state.sampleRate = recorder.sampleRate();
     state.bytesPerFrame = bytesPerFrame;
+    state.signal.configure(recorder.sampleRate(), recorder.channels());
+    if (opts.testSignal) {
+        std::cout << "sending the test signal instead of the input\n";
+    }
 
     PacketSender sender(tx, packetRing, ready, stats);
 

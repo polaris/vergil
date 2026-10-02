@@ -11,6 +11,7 @@ add_executable(vergil_tests
     test_resampler.cpp
     test_rate_loop.cpp
     test_presentation_timeline.cpp
+    test_test_signal.cpp
 )
 
 target_compile_features(vergil_tests PRIVATE cxx_std_20)

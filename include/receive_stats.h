@@ -40,6 +40,7 @@ struct alignas(128) PlaybackStats {
     std::atomic<std::uint64_t> lateFrames{0};       // discarded because they arrived after they were due
     std::atomic<std::uint64_t> realigns{0};         // starts over because the error grew too large
     std::atomic<std::uint64_t> clockSteps{0};       // starts over because the clock mapping was re-seeded
+    std::atomic<std::uint64_t> logOverflows{0};     // playout log rows lost to a full queue
     // Lowest (ring fill - what the next read takes) over the last second.
     // Negative when that second underran; kHeadroomUnknown until playing.
     std::atomic<std::int64_t> headroom{kHeadroomUnknown};

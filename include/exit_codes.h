@@ -7,6 +7,7 @@ namespace exit_code {
 
 constexpr int kNetwork = 1;    // no usable interface, or a socket or the clock sync failed
 constexpr int kAudio = 2;      // no usable audio device, or it failed to open or start
+constexpr int kFile = 3;       // a file to write could not be opened
 
 }  // namespace exit_code
 

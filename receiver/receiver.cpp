@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <future>
 #include <iostream>
 #include <limits>
@@ -28,6 +29,7 @@
 #include "exit_codes.h"
 #include "frame_ring.h"
 #include "netint.h"
+#include "playout_log.h"
 #include "presentation_timeline.h"
 #include "rate_loop.h"
 #include "receive_stats.h"
@@ -84,6 +86,7 @@ struct PlaybackState {
     ReportQueue* reports = nullptr;
     PlaybackStats* stats = nullptr;
     const clocksync::ClockSync* clock = nullptr;
+    PlayoutQueue* log = nullptr;        // none without --log
 
     Clock::time_point origin;
     double originSeconds = 0.0;         // origin as clocksync's local time: seconds since the steady epoch
@@ -92,6 +95,8 @@ struct PlaybackState {
     TimeFilter timeFilter{};
     PresentationTimeline timeline{};
     std::optional<ClockMapping> mapping;    // the last one read
+    double heardLocal = 0.0;            // when this callback is heard, local and master time
+    double heardMaster = 0.0;
     RateLoop loop{};
     Resampler resampler{};
     std::int64_t windowMinHeadroom = std::numeric_limits<std::int64_t>::max();
@@ -115,6 +120,7 @@ void printReceiveStats(const ReceiveStats& stats, const PlaybackStats& playback)
               << ", late frames " << playback.lateFrames.load()
               << ", realigns " << playback.realigns.load()
               << ", clock steps " << playback.clockSteps.load()
+              << ", log overflows " << playback.logOverflows.load()
               << "\n";
 }
 
@@ -160,8 +166,9 @@ void onUnderrun(PlaybackState& s, ma_uint32 frameCount) {
         return std::nullopt;
     }
 
-    const double heard = localToMaster(s.originSeconds + tD + s.outputLatency, *s.mapping);
-    const auto ahead = s.timeline.framesAhead(heard, s.ring->readPosition());
+    s.heardLocal = s.originSeconds + tD + s.outputLatency;
+    s.heardMaster = localToMaster(s.heardLocal, *s.mapping);
+    const auto ahead = s.timeline.framesAhead(s.heardMaster, s.ring->readPosition());
     if (!ahead) {
         return std::nullopt;
     }
@@ -238,6 +245,10 @@ void onPlayback(void* user, void* output, ma_uint32 frameCount) {
                         reinterpret_cast<const std::int16_t*>(in.region2().buf), in.region2().len,
                         static_cast<std::int16_t*>(output), frameCount);
     (void)s.ring->commitRead(need);
+
+    if (s.log && !s.log->push({s.heardLocal, s.heardMaster, s.loop.error(), s.loop.correction()})) {
+        s.stats->logOverflows.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 class PacketReceiver {
@@ -452,6 +463,8 @@ struct Options {
     unsigned int senderSampleRate = kDefaultSampleRate;
     unsigned int periodSizeInFrames = kPeriodSizeInFrames;
     double outputLatencyMs = kDefaultOutputLatencyMs;
+    std::string logPath;
+    bool kernelTimestamps = false;
     std::string networkInterface;
     std::string multicastGroup{streaming::kDefaultAudioGroup};
     unsigned short multicastPort = streaming::kDefaultAudioPort;
@@ -493,6 +506,10 @@ std::optional<int> parseOptions(int argc, char** argv, const AudioContext& audio
     app.add_option("--outputLatency", opts.outputLatencyMs,
                    "Milliseconds from the audio callback to the sound leaving the speaker; measure it per receiver")
         ->check(CLI::NonNegativeNumber);
+    app.add_option("--log", opts.logPath,
+                   "Write when each callback is heard and how far off it plays to this CSV file");
+    app.add_flag("--kernelTimestamps", opts.kernelTimestamps,
+                 "Clock sync: stamp received messages in the kernel, if the system offers it");
     app.add_option("-n,--networkInterface", opts.networkInterface, "Network interface");
     app.add_option("-m,--multicastGroup", opts.multicastGroup, "Multicast group address")
         ->check(CLI::ValidIPV4);
@@ -560,6 +577,7 @@ int main(int argc, char** argv) {
             .group = udp::endpoint(asio::ip::make_address(kClockGroup), kClockPort),
             .iface = *iface,
             .nodeId = clocksync::randomNodeId(),
+            .useKernelspaceStamps = opts.kernelTimestamps,
         }, clocksync::Role::Slave);
     } catch (const std::exception& e) {
         std::cerr << "Failed to set up the clock-sync slave: " << e.what() << "\n";
@@ -579,6 +597,17 @@ int main(int argc, char** argv) {
     ReceiveStats stats;
     PlaybackStats playbackStats;
 
+    // Opened up front, so a bad path fails before anything starts.
+    std::ofstream logFile;
+    PlayoutQueue logQueue;
+    if (!opts.logPath.empty()) {
+        logFile.open(opts.logPath);
+        if (!logFile) {
+            std::cerr << "Cannot write the log file " << opts.logPath << "\n";
+            return exit_code::kFile;
+        }
+    }
+
     const auto origin = Clock::now();
 
     PlaybackState state{
@@ -587,6 +616,7 @@ int main(int argc, char** argv) {
         .reports = &reports,
         .stats = &playbackStats,
         .clock = &*clock,
+        .log = logFile.is_open() ? &logQueue : nullptr,
         .origin = origin,
         .originSeconds = toSeconds(sinceEpoch(origin)),
     };
@@ -625,6 +655,7 @@ int main(int argc, char** argv) {
     asio::io_context control;
     StatusReporter reporter(control, io, [&receiver]{ return receiver.takeSnapshot(); }, playbackStats, *clock,
                             opts.senderSampleRate, deviceRate, bytesPerFrame, origin);
+    PlayoutLogWriter logWriter(control, logQueue, logFile);
 
     // Before playback, so the mapping can settle while the receiver is silent.
     clock->start();
@@ -649,10 +680,16 @@ int main(int argc, char** argv) {
     }
 
     reporter.start();
+    if (logFile.is_open()) {
+        logWriter.start();
+    }
     runUntilShutdownSignal(control);
     reporter.stop();
 
     player.stop();
+    if (logFile.is_open()) {
+        logWriter.stop();       // after the audio thread, so the last rows are in
+    }
 
     // From inside the io thread, which owns the receiver.
     asio::post(io, [&receiver]{ receiver.stop(); });
