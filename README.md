@@ -26,10 +26,10 @@ One **sender** captures audio from an input device and multicasts it as UDP pack
 - **Adaptive resampling.** On each callback, the receiver works out which input frame should be playing now, compares it with the frame about to be played, and adjusts the resampling ratio by at most ±0.5 %. A windowed-sinc resampler with fractional position tracking applies the ratio. Errors larger than 5 ms trigger a re-alignment instead of a slow correction.
 - **Real-time friendly.** The audio threads do not lock or allocate. Data moves between threads through lock-free single-producer/single-consumer rings, and the audio and network threads ask the OS for real-time priority.
 
-The control loops follow Fons Adriaensen's papers, which are included in [`docs/`](docs):
+The control loops follow Fons Adriaensen's papers:
 
-- [Using a DLL to filter time](docs/usingdll.pdf)
-- [Controlling adaptive resampling](docs/adapt-resamp.pdf)
+- [Using a DLL to filter time](https://kokkinizita.linuxaudio.org/papers/usingdll.pdf)
+- [Controlling adaptive resampling](https://kokkinizita.linuxaudio.org/papers/adapt-resamp.pdf)
 
 ## Requirements
 
